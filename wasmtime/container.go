@@ -21,12 +21,12 @@ package wasmtime
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -49,6 +49,8 @@ type Exit struct {
 
 // NewContainer returns a new runc container
 func NewContainer(ctx context.Context, platform rproc.Platform, r *task.CreateTaskRequest, ec chan<- Exit) (c *Container, err error) {
+	logrus.Infof("new WASM container %s ...", r.Bundle)
+
 	//ns, err := namespaces.NamespaceRequired(ctx)
 	//if err != nil {
 	//	return nil, errors.Wrap(err, "create namespace")
@@ -91,7 +93,8 @@ func NewContainer(ctx context.Context, platform rproc.Platform, r *task.CreateTa
 		}
 		if rootfs == "" {
 			rootfs = filepath.Join(r.Bundle, "rootfs")
-			if err := os.Mkdir(rootfs, 0711); err != nil {
+			if err := os.MkdirAll(rootfs, 0711); err != nil {
+				logrus.Errorf("failed to mkdir %s: %v", rootfs, err)
 				return nil, err
 			}
 		}
@@ -123,10 +126,15 @@ func NewContainer(ctx context.Context, platform rproc.Platform, r *task.CreateTa
 	} else {
 		return nil, errors.Wrapf(errdefs.ErrInvalidArgument, "no root provided")
 	}
-	rootRemap = fmt.Sprintf("/:%s", rootfs)
-	if len(spec.Process.Args) > 0 {
-		// TODO: bound this
-		spec.Process.Args[0] = filepath.Join(rootfs, spec.Process.Args[0])
+	rootRemap = ".:/"
+	var args []string
+	argsLen := len(spec.Process.Args)
+	if argsLen > 0 {
+		args = append(args, filepath.Join(rootfs, spec.Process.Args[0]))
+		if argsLen > 1 {
+			args = append(args, "--")
+			args = append(args, spec.Process.Args[1:]...)
+		}
 	}
 
 	p := &process{
@@ -140,10 +148,11 @@ func NewContainer(ctx context.Context, platform rproc.Platform, r *task.CreateTa
 		remaps: []string{
 			rootRemap,
 		},
+		rootfs: rootfs,
 		exited: make(chan struct{}),
 		ec:     ec,
 		env:    spec.Process.Env,
-		args:   spec.Process.Args,
+		args:   args,
 	}
 
 	container := &Container{
@@ -407,6 +416,7 @@ type process struct {
 	exited     chan struct{}
 	ec         chan<- Exit
 
+	rootfs string
 	remaps []string
 	env    []string
 	args   []string
@@ -470,14 +480,20 @@ func (p *process) Resize(ws console.WinSize) error {
 
 func (p *process) Start(context.Context) (err error) {
 	var args []string
-	for _, rm := range p.remaps {
-		args = append(args, "--mapdir="+rm)
-	}
+
+	args = append(args, "run")
+
+	// for _, rm := range p.remaps {
+	// 	args = append(args, "--mapdir="+rm)
+	// }
+
 	for _, env := range p.env {
 		args = append(args, "--env="+env)
 	}
 	args = append(args, p.args...)
-	cmd := exec.Command("wasmtime", args...)
+	logrus.Infof("exec wasmer %s", strings.Join(args, " "))
+	cmd := exec.Command("wasmer", args...)
+	cmd.Dir = p.rootfs
 
 	var in io.Closer
 	var closers []io.Closer
