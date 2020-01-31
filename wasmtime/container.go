@@ -130,7 +130,7 @@ func NewContainer(ctx context.Context, platform rproc.Platform, r *task.CreateTa
 	var args []string
 	argsLen := len(spec.Process.Args)
 	if argsLen > 0 {
-		args = append(args, filepath.Join(rootfs, spec.Process.Args[0]))
+		args = append(args, spec.Process.Args[0])
 		if argsLen > 1 {
 			args = append(args, "--")
 			args = append(args, spec.Process.Args[1:]...)
@@ -481,14 +481,17 @@ func (p *process) Resize(ws console.WinSize) error {
 func (p *process) Start(context.Context) (err error) {
 	var args []string
 
-	args = append(args, "run")
+	args = append(args, "run", "--dir=.")
 
 	// for _, rm := range p.remaps {
 	// 	args = append(args, "--mapdir="+rm)
 	// }
 
 	for _, env := range p.env {
-		args = append(args, "--env="+env)
+		// Ignore the PATH env
+		if !strings.HasPrefix(env, "PATH=") {
+			args = append(args, "--env="+env)
+		}
 	}
 	args = append(args, p.args...)
 	logrus.Infof("exec wasmer %s", strings.Join(args, " "))

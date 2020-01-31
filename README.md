@@ -4,4 +4,4 @@
 
 A wasm implementation of a containerd runtime using the containerd shim interface
 
-Uses wasmtime to execute wasm/wasi binaries
+Uses wasmer to execute wasm/wasi binaries
