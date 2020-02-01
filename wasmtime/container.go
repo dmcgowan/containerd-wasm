@@ -479,23 +479,31 @@ func (p *process) Resize(ws console.WinSize) error {
 }
 
 func (p *process) Start(context.Context) (err error) {
-	var args []string
+	var cmd *exec.Cmd
 
-	args = append(args, "run", "--dir=.")
+	if len(p.args) > 0 && p.args[0] == "/pause" {
+		// Hack for /pause
+		logrus.Info("exec pause")
+		cmd = exec.Command("./pause")
+	} else {
+		var args []string
+		args = append(args, "run", "--dir=.")
 
-	// for _, rm := range p.remaps {
-	// 	args = append(args, "--mapdir="+rm)
-	// }
+		// for _, rm := range p.remaps {
+		// 	args = append(args, "--mapdir="+rm)
+		// }
 
-	for _, env := range p.env {
-		// Ignore the PATH env
-		if !strings.HasPrefix(env, "PATH=") {
-			args = append(args, "--env="+env)
+		for _, env := range p.env {
+			// Ignore the PATH env
+			if !strings.HasPrefix(env, "PATH=") {
+				args = append(args, "--env="+env)
+			}
 		}
+		args = append(args, p.args...)
+		logrus.Infof("exec wasmer %s", strings.Join(args, " "))
+		cmd = exec.Command("wasmer", args...)
 	}
-	args = append(args, p.args...)
-	logrus.Infof("exec wasmer %s", strings.Join(args, " "))
-	cmd := exec.Command("wasmer", args...)
+
 	cmd.Dir = p.rootfs
 
 	var in io.Closer
@@ -552,6 +560,7 @@ func (p *process) Start(context.Context) (err error) {
 		return err
 	}
 	p.process = cmd.Process
+	p.pid = cmd.Process.Pid
 	p.stdin = in
 	p.mu.Unlock()
 
@@ -566,6 +575,7 @@ func (p *process) Start(context.Context) (err error) {
 			// TODO: Make this cross platform
 			p.exitStatus = int(waitStatus.Sys().(syscall.WaitStatus))
 		}
+		p.process = nil
 		p.mu.Unlock()
 
 		close(p.exited)
@@ -593,7 +603,9 @@ func (p *process) Kill(context.Context, uint32, bool) error {
 	p.mu.Unlock()
 
 	if !running {
-		return errors.New("not started")
+		// return errors.New("not started")
+		// Ignore the kill signal
+		return nil
 	}
 
 	return p.process.Kill()
