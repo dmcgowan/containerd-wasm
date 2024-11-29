@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*
    Copyright The containerd Authors.
@@ -20,28 +20,32 @@ package wasmtime
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	"net/url"
 	"sync"
 	"syscall"
 
 	"github.com/containerd/console"
-	rproc "github.com/containerd/containerd/runtime/proc"
+	"github.com/containerd/containerd/v2/pkg/stdio"
 	"github.com/containerd/fifo"
-	"github.com/pkg/errors"
 )
 
 var bufPool = sync.Pool{
 	New: func() interface{} {
-		buffer := make([]byte, 32<<10)
+		// setting to 4096 to align with PIPE_BUF
+		// http://man7.org/linux/man-pages/man7/pipe.7.html
+		buffer := make([]byte, 4096)
 		return &buffer
 	},
 }
 
 // NewPlatform returns a linux platform for use with I/O operations
-func NewPlatform() (rproc.Platform, error) {
+func NewPlatform() (stdio.Platform, error) {
 	epoller, err := console.NewEpoller()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to initialize epoller")
+		return nil, fmt.Errorf("failed to initialize epoller: %w", err)
 	}
 	go epoller.Wait()
 	return &linuxPlatform{
@@ -53,7 +57,7 @@ type linuxPlatform struct {
 	epoller *console.Epoller
 }
 
-func (p *linuxPlatform) CopyConsole(ctx context.Context, console console.Console, stdin, stdout, stderr string, wg *sync.WaitGroup) (console.Console, error) {
+func (p *linuxPlatform) CopyConsole(ctx context.Context, console console.Console, id, stdin, stdout, stderr string, wg *sync.WaitGroup) (cons console.Console, retErr error) {
 	if p.epoller == nil {
 		return nil, errors.New("uninitialized epoller")
 	}
@@ -77,30 +81,43 @@ func (p *linuxPlatform) CopyConsole(ctx context.Context, console console.Console
 			io.CopyBuffer(epollConsole, in, *bp)
 			// we need to shutdown epollConsole when pipe broken
 			epollConsole.Shutdown(p.epoller.CloseConsole)
+			epollConsole.Close()
+			in.Close()
 		}()
 	}
 
-	outw, err := fifo.OpenFifo(ctx, stdout, syscall.O_WRONLY, 0)
+	uri, err := url.Parse(stdout)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to parse stdout uri: %w", err)
 	}
-	outr, err := fifo.OpenFifo(ctx, stdout, syscall.O_RDONLY, 0)
-	if err != nil {
-		return nil, err
+
+	switch uri.Scheme {
+	case "binary":
+		return nil, fmt.Errorf("binary scheme is unsupported")
+	default:
+		outw, err := fifo.OpenFifo(ctx, stdout, syscall.O_WRONLY, 0)
+		if err != nil {
+			return nil, err
+		}
+		outr, err := fifo.OpenFifo(ctx, stdout, syscall.O_RDONLY, 0)
+		if err != nil {
+			return nil, err
+		}
+		wg.Add(1)
+		cwg.Add(1)
+		go func() {
+			cwg.Done()
+			buf := bufPool.Get().(*[]byte)
+			defer bufPool.Put(buf)
+			io.CopyBuffer(outw, epollConsole, *buf)
+
+			outw.Close()
+			outr.Close()
+			wg.Done()
+		}()
+		cwg.Wait()
 	}
-	wg.Add(1)
-	cwg.Add(1)
-	go func() {
-		cwg.Done()
-		buf := bufPool.Get().(*[]byte)
-		defer bufPool.Put(buf)
-		io.CopyBuffer(outw, epollConsole, *buf)
-		epollConsole.Close()
-		outr.Close()
-		outw.Close()
-		wg.Done()
-	}()
-	cwg.Wait()
+
 	return epollConsole, nil
 }
 
@@ -110,7 +127,7 @@ func (p *linuxPlatform) ShutdownConsole(ctx context.Context, cons console.Consol
 	}
 	epollConsole, ok := cons.(*console.EpollConsole)
 	if !ok {
-		return errors.Errorf("expected EpollConsole, got %#v", cons)
+		return fmt.Errorf("expected EpollConsole, got %#v", cons)
 	}
 	return epollConsole.Shutdown(p.epoller.CloseConsole)
 }

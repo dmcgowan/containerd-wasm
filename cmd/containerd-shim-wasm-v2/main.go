@@ -17,10 +17,12 @@ package main
 */
 
 import (
-	"github.com/containerd/containerd/runtime/v2/shim"
+	"context"
+
+	"github.com/containerd/containerd/v2/pkg/shim"
 	wasm "github.com/dmcgowan/containerd-wasm"
 )
 
 func main() {
-	shim.Run("io.containerd.wasm.v1", wasm.New)
+	shim.Run(context.Background(), wasm.NewManager("io.containerd.wasm.v1"))
 }
