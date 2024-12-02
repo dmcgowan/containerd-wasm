@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 /*
@@ -31,12 +32,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containerd/cgroups"
+	"github.com/containerd/cgroups/v3/cgroup1"
 	"github.com/containerd/console"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/mount"
-	rproc "github.com/containerd/containerd/runtime/proc"
-	"github.com/containerd/containerd/runtime/v2/task"
+	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/pkg/stdio"
+	"github.com/containerd/errdefs"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -48,7 +49,7 @@ type Exit struct {
 }
 
 // NewContainer returns a new runc container
-func NewContainer(ctx context.Context, platform rproc.Platform, r *task.CreateTaskRequest, ec chan<- Exit) (c *Container, err error) {
+func NewContainer(ctx context.Context, platform stdio.Platform, r *taskAPI.CreateTaskRequest, ec chan<- Exit) (c *Container, err error) {
 	//ns, err := namespaces.NamespaceRequired(ctx)
 	//if err != nil {
 	//	return nil, errors.Wrap(err, "create namespace")
@@ -91,7 +92,7 @@ func NewContainer(ctx context.Context, platform rproc.Platform, r *task.CreateTa
 		}
 		if rootfs == "" {
 			rootfs = filepath.Join(r.Bundle, "rootfs")
-			if err := os.Mkdir(rootfs, 0711); err != nil {
+			if err := os.MkdirAll(rootfs, 0711); err != nil {
 				return nil, err
 			}
 		}
@@ -123,15 +124,15 @@ func NewContainer(ctx context.Context, platform rproc.Platform, r *task.CreateTa
 	} else {
 		return nil, errors.Wrapf(errdefs.ErrInvalidArgument, "no root provided")
 	}
-	rootRemap = fmt.Sprintf("/:%s", rootfs)
+	rootRemap = fmt.Sprintf("%s::/", rootfs) // --dir <HOST_DIR[::GUEST_DIR]> (wasmtime v27)
 	if len(spec.Process.Args) > 0 {
 		// TODO: bound this
 		spec.Process.Args[0] = filepath.Join(rootfs, spec.Process.Args[0])
 	}
 
-	p := &process{
+	p := &Process{
 		id: r.ID,
-		stdio: rproc.Stdio{
+		stdio: stdio.Stdio{
 			Stdin:    r.Stdin,
 			Stdout:   r.Stdout,
 			Stderr:   r.Stderr,
@@ -150,16 +151,16 @@ func NewContainer(ctx context.Context, platform rproc.Platform, r *task.CreateTa
 		ID:        r.ID,
 		Bundle:    r.Bundle,
 		process:   p,
-		processes: make(map[string]rproc.Process),
+		processes: make(map[string]*Process),
 	}
 
 	pid := p.Pid()
 	if pid > 0 {
-		cg, err := cgroups.Load(cgroups.V1, cgroups.PidPath(pid))
+		cg, err := cgroup1.Load(cgroup1.PidPath(pid))
 		if err != nil {
 			logrus.WithError(err).Errorf("loading cgroup for %d", pid)
+			container.cgroup = cg
 		}
-		container.cgroup = cg
 	}
 	logrus.Infof("process created: %#v", p)
 
@@ -192,13 +193,13 @@ type Container struct {
 	RootRemap string
 
 	ec        chan<- Exit
-	cgroup    cgroups.Cgroup
-	process   rproc.Process
-	processes map[string]rproc.Process
+	cgroup    cgroup1.Cgroup
+	process   *Process
+	processes map[string]*Process
 }
 
 // All processes in the container
-func (c *Container) All() (o []rproc.Process) {
+func (c *Container) All() (o []*Process) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -212,7 +213,7 @@ func (c *Container) All() (o []rproc.Process) {
 }
 
 // ExecdProcesses added to the container
-func (c *Container) ExecdProcesses() (o []rproc.Process) {
+func (c *Container) ExecdProcesses() (o []*Process) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, p := range c.processes {
@@ -229,21 +230,21 @@ func (c *Container) Pid() int {
 }
 
 // Cgroup of the container
-func (c *Container) Cgroup() cgroups.Cgroup {
+func (c *Container) Cgroup() cgroup1.Cgroup {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.cgroup
 }
 
 // CgroupSet sets the cgroup to the container
-func (c *Container) CgroupSet(cg cgroups.Cgroup) {
+func (c *Container) CgroupSet(cg cgroup1.Cgroup) {
 	c.mu.Lock()
 	c.cgroup = cg
 	c.mu.Unlock()
 }
 
 // Process returns the process by id
-func (c *Container) Process(id string) (rproc.Process, error) {
+func (c *Container) Process(id string) (*Process, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if id == "" {
@@ -268,7 +269,7 @@ func (c *Container) ProcessExists(id string) bool {
 }
 
 // ProcessAdd adds a new process to the container
-func (c *Container) ProcessAdd(process rproc.Process) {
+func (c *Container) ProcessAdd(process *Process) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.processes[process.ID()] = process
@@ -282,7 +283,7 @@ func (c *Container) ProcessRemove(id string) {
 }
 
 // Start a container process
-func (c *Container) Start(ctx context.Context, r *task.StartRequest) (rproc.Process, error) {
+func (c *Container) Start(ctx context.Context, r *taskAPI.StartRequest) (*Process, error) {
 	logrus.Info("starting")
 	p, err := c.Process(r.ExecID)
 	if err != nil {
@@ -295,7 +296,7 @@ func (c *Container) Start(ctx context.Context, r *task.StartRequest) (rproc.Proc
 
 	logrus.Info("done starting", p)
 	if c.Cgroup() == nil && p.Pid() > 0 {
-		cg, err := cgroups.Load(cgroups.V1, cgroups.PidPath(p.Pid()))
+		cg, err := cgroup1.Load(cgroup1.PidPath(p.Pid()))
 		if err != nil {
 			logrus.WithError(err).Errorf("loading cgroup for %d", p.Pid())
 		}
@@ -306,7 +307,7 @@ func (c *Container) Start(ctx context.Context, r *task.StartRequest) (rproc.Proc
 }
 
 // Delete the container or a process by id
-func (c *Container) Delete(ctx context.Context, r *task.DeleteRequest) (rproc.Process, error) {
+func (c *Container) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*Process, error) {
 	p, err := c.Process(r.ExecID)
 	if err != nil {
 		return nil, err
@@ -321,7 +322,7 @@ func (c *Container) Delete(ctx context.Context, r *task.DeleteRequest) (rproc.Pr
 }
 
 // Exec an additional process
-func (c *Container) Exec(ctx context.Context, r *task.ExecProcessRequest) (rproc.Process, error) {
+func (c *Container) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (*Process, error) {
 	return nil, errors.Wrap(errdefs.ErrNotImplemented, "exec not implemented")
 }
 
@@ -336,7 +337,7 @@ func (c *Container) Resume(ctx context.Context) error {
 }
 
 // ResizePty of a process
-func (c *Container) ResizePty(ctx context.Context, r *task.ResizePtyRequest) error {
+func (c *Container) ResizePty(ctx context.Context, r *taskAPI.ResizePtyRequest) error {
 	p, err := c.Process(r.ExecID)
 	if err != nil {
 		return err
@@ -349,7 +350,7 @@ func (c *Container) ResizePty(ctx context.Context, r *task.ResizePtyRequest) err
 }
 
 // Kill a process
-func (c *Container) Kill(ctx context.Context, r *task.KillRequest) error {
+func (c *Container) Kill(ctx context.Context, r *taskAPI.KillRequest) error {
 	p, err := c.Process(r.ExecID)
 	if err != nil {
 		return err
@@ -358,7 +359,7 @@ func (c *Container) Kill(ctx context.Context, r *task.KillRequest) error {
 }
 
 // CloseIO of a process
-func (c *Container) CloseIO(ctx context.Context, r *task.CloseIORequest) error {
+func (c *Container) CloseIO(ctx context.Context, r *taskAPI.CloseIORequest) error {
 	p, err := c.Process(r.ExecID)
 	if err != nil {
 		return err
@@ -372,12 +373,12 @@ func (c *Container) CloseIO(ctx context.Context, r *task.CloseIORequest) error {
 }
 
 // Checkpoint the container
-func (c *Container) Checkpoint(ctx context.Context, r *task.CheckpointTaskRequest) error {
+func (c *Container) Checkpoint(ctx context.Context, r *taskAPI.CheckpointTaskRequest) error {
 	return errors.Wrap(errdefs.ErrNotImplemented, "checkpoint not implemented")
 }
 
 // Update the resource information of a running container
-func (c *Container) Update(ctx context.Context, r *task.UpdateTaskRequest) error {
+func (c *Container) Update(ctx context.Context, r *taskAPI.UpdateTaskRequest) error {
 	return errors.Wrap(errdefs.ErrNotImplemented, "update not implemented")
 }
 
@@ -394,14 +395,14 @@ func (c *Container) HasPid(pid int) bool {
 	return false
 }
 
-type process struct {
+type Process struct {
 	mu sync.Mutex
 
 	id         string
 	pid        int
 	exitStatus int
 	exitTime   time.Time
-	stdio      rproc.Stdio
+	stdio      stdio.Stdio
 	stdin      io.Closer
 	process    *os.Process
 	exited     chan struct{}
@@ -414,37 +415,37 @@ type process struct {
 	waitError error
 }
 
-func (p *process) ID() string {
+func (p *Process) ID() string {
 	return p.id
 }
 
-func (p *process) Pid() int {
+func (p *Process) Pid() int {
 	return p.pid
 }
 
-func (p *process) ExitStatus() int {
+func (p *Process) ExitStatus() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.exitStatus
 }
 
-func (p *process) ExitedAt() time.Time {
+func (p *Process) ExitedAt() time.Time {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.exitTime
 }
 
-func (p *process) Stdin() io.Closer {
+func (p *Process) Stdin() io.Closer {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.stdin
 }
 
-func (p *process) Stdio() rproc.Stdio {
+func (p *Process) Stdio() stdio.Stdio {
 	return p.stdio
 }
 
-func (p *process) Status(context.Context) (string, error) {
+func (p *Process) Status(context.Context) (string, error) {
 	select {
 	case <-p.exited:
 	default:
@@ -460,18 +461,18 @@ func (p *process) Status(context.Context) (string, error) {
 	return "stopped", nil
 }
 
-func (p *process) Wait() {
+func (p *Process) Wait() {
 	<-p.exited
 }
 
-func (p *process) Resize(ws console.WinSize) error {
+func (p *Process) Resize(ws console.WinSize) error {
 	return nil
 }
 
-func (p *process) Start(context.Context) (err error) {
+func (p *Process) Start(context.Context) (err error) {
 	var args []string
 	for _, rm := range p.remaps {
-		args = append(args, "--mapdir="+rm)
+		args = append(args, "--dir="+rm)
 	}
 	for _, env := range p.env {
 		args = append(args, "--env="+env)
@@ -564,11 +565,11 @@ func (p *process) Start(context.Context) (err error) {
 	return nil
 }
 
-func (p *process) Delete(context.Context) error {
+func (p *Process) Delete(context.Context) error {
 	return nil
 }
 
-func (p *process) Kill(context.Context, uint32, bool) error {
+func (p *Process) Kill(context.Context, uint32, bool) error {
 	p.mu.Lock()
 	running := p.process != nil
 	p.mu.Unlock()
@@ -580,7 +581,7 @@ func (p *process) Kill(context.Context, uint32, bool) error {
 	return p.process.Kill()
 }
 
-func (p *process) SetExited(status int) {
+func (p *Process) SetExited(status int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.exitStatus = status

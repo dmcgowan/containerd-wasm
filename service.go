@@ -19,34 +19,53 @@ package wasm
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/containerd/cgroups"
+	"github.com/containerd/cgroups/v3"
+	"github.com/containerd/cgroups/v3/cgroup1"
 	eventstypes "github.com/containerd/containerd/api/events"
+	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
+	"github.com/containerd/containerd/api/types"
+	apitypes "github.com/containerd/containerd/api/types"
+	"github.com/containerd/containerd/api/types/runc/options"
 	"github.com/containerd/containerd/api/types/task"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/namespaces"
-	rproc "github.com/containerd/containerd/runtime/proc"
-	"github.com/containerd/containerd/runtime/v2/runc/options"
-	"github.com/containerd/containerd/runtime/v2/shim"
-	taskAPI "github.com/containerd/containerd/runtime/v2/task"
-	"github.com/containerd/typeurl"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/containerd/v2/pkg/oom"
+	oomv1 "github.com/containerd/containerd/v2/pkg/oom/v1"
+	oomv2 "github.com/containerd/containerd/v2/pkg/oom/v2"
+	"github.com/containerd/containerd/v2/pkg/protobuf"
+	ptypes "github.com/containerd/containerd/v2/pkg/protobuf/types"
+	"github.com/containerd/containerd/v2/pkg/schedcore"
+	"github.com/containerd/containerd/v2/pkg/shim"
+	"github.com/containerd/containerd/v2/pkg/shutdown"
+	"github.com/containerd/containerd/v2/pkg/stdio"
+	"github.com/containerd/containerd/v2/plugins"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
+	"github.com/containerd/log"
+	"github.com/containerd/plugin"
+	"github.com/containerd/plugin/registry"
+	"github.com/containerd/ttrpc"
+	"github.com/containerd/typeurl/v2"
 	"github.com/dmcgowan/containerd-wasm/wasmtime"
-	ptypes "github.com/gogo/protobuf/types"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
+	goruntime "runtime"
 )
 
 var (
-	_     = (taskAPI.TaskService)(&service{})
+	_     = shim.TTRPCService(&service{})
 	empty = &ptypes.Empty{}
 )
 
@@ -62,25 +81,52 @@ type spec struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
-// New returns a new shim service that can be used via GRPC
-func New(ctx context.Context, id string, publisher shim.Publisher, shutdown func()) (shim.Shim, error) {
-	ep, err := wasmtime.NewOOMEpoller(publisher)
+func init() {
+	registry.Register(&plugin.Registration{
+		Type: plugins.TTRPCPlugin,
+		ID:   "task",
+		Requires: []plugin.Type{
+			plugins.EventPlugin,
+			plugins.InternalPlugin,
+		},
+		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
+			pp, err := ic.GetByID(plugins.EventPlugin, "publisher")
+			if err != nil {
+				return nil, err
+			}
+			ss, err := ic.GetByID(plugins.InternalPlugin, "shutdown")
+			if err != nil {
+				return nil, err
+			}
+			return newTaskService(ic.Context, pp.(shim.Publisher), ss.(shutdown.Service))
+		},
+	})
+}
+
+func newTaskService(ctx context.Context, publisher shim.Publisher, sd shutdown.Service) (taskAPI.TTRPCTaskService, error) {
+	var (
+		ep  oom.Watcher
+		err error
+	)
+	if cgroups.Mode() == cgroups.Unified {
+		ep, err = oomv2.New(publisher)
+	} else {
+		ep, err = oomv1.New(publisher)
+	}
 	if err != nil {
 		return nil, err
 	}
 	go ep.Run(ctx)
 	s := &service{
-		id:         id,
 		context:    ctx,
 		events:     make(chan interface{}, 128),
 		ec:         make(chan wasmtime.Exit),
 		ep:         ep,
-		cancel:     shutdown,
+		shutdown:   sd,
 		containers: make(map[string]*wasmtime.Container),
 	}
 	go s.processExits()
 	if err := s.initPlatform(); err != nil {
-		shutdown()
 		return nil, errors.Wrap(err, "failed to initialized platform behavior")
 	}
 	go s.forward(ctx, publisher)
@@ -94,19 +140,19 @@ type service struct {
 
 	context  context.Context
 	events   chan interface{}
-	platform rproc.Platform
+	platform stdio.Platform
 	ec       chan wasmtime.Exit
-	ep       *wasmtime.Epoller
+	ep       oom.Watcher
 
 	// id only used in cleanup case
 	id string
 
 	containers map[string]*wasmtime.Container
 
-	cancel func()
+	shutdown shutdown.Service
 }
 
-func newCommand(ctx context.Context, id, containerdBinary, containerdAddress string) (*exec.Cmd, error) {
+func newCommand(ctx context.Context, id, containerdAddress, containerdTTRPCAddress string, debug bool) (*exec.Cmd, error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
 		return nil, err
@@ -124,6 +170,9 @@ func newCommand(ctx context.Context, id, containerdBinary, containerdAddress str
 		"-id", id,
 		"-address", containerdAddress,
 	}
+	if debug {
+		args = append(args, "-debug")
+	}
 	cmd := exec.Command(self, args...)
 	cmd.Dir = cwd
 	cmd.Env = append(os.Environ(), "GOMAXPROCS=4")
@@ -134,7 +183,7 @@ func newCommand(ctx context.Context, id, containerdBinary, containerdAddress str
 }
 
 func readSpec() (*spec, error) {
-	f, err := os.Open("config.json")
+	f, err := os.Open(oci.ConfigFilename)
 	if err != nil {
 		return nil, err
 	}
@@ -146,15 +195,89 @@ func readSpec() (*spec, error) {
 	return &s, nil
 }
 
-func (s *service) StartShim(ctx context.Context, id, containerdBinary, containerdAddress string) (string, error) {
-	cmd, err := newCommand(ctx, id, containerdBinary, containerdAddress)
+type shimSocket struct {
+	addr string
+	s    *net.UnixListener
+	f    *os.File
+}
+
+func (s *shimSocket) Close() {
+	if s.s != nil {
+		s.s.Close()
+	}
+	if s.f != nil {
+		s.f.Close()
+	}
+	_ = shim.RemoveSocket(s.addr)
+}
+
+func newShimSocket(ctx context.Context, path, id string, debug bool) (*shimSocket, error) {
+	address, err := shim.SocketAddress(ctx, path, id, debug)
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+	socket, err := shim.NewSocket(address)
+	if err != nil {
+		// the only time where this would happen is if there is a bug and the socket
+		// was not cleaned up in the cleanup method of the shim or we are using the
+		// grouping functionality where the new process should be run with the same
+		// shim as an existing container
+		if !shim.SocketEaddrinuse(err) {
+			return nil, fmt.Errorf("create new shim socket: %w", err)
+		}
+		if !debug && shim.CanConnect(address) {
+			return &shimSocket{addr: address}, errdefs.ErrAlreadyExists
+		}
+		if err := shim.RemoveSocket(address); err != nil {
+			return nil, fmt.Errorf("remove pre-existing socket: %w", err)
+		}
+		if socket, err = shim.NewSocket(address); err != nil {
+			return nil, fmt.Errorf("try create new shim socket 2x: %w", err)
+		}
+	}
+	s := &shimSocket{
+		addr: address,
+		s:    socket,
+	}
+	f, err := socket.File()
+	if err != nil {
+		s.Close()
+		return nil, err
+	}
+	s.f = f
+	return s, nil
+}
+
+func NewManager(name string) shim.Manager {
+	return manager{name: name}
+}
+
+// manager is implemented based on https://github.com/containerd/containerd/blob/v2.0.0/cmd/containerd-shim-runc-v2/manager/manager_linux.go
+type manager struct {
+	name                   string
+	containerdAddress      string
+	containerdTTRPCAddress string
+	env                    []string
+	runtimePaths           sync.Map
+}
+
+func (m manager) Name() string {
+	return m.name
+}
+
+func (m manager) Start(ctx context.Context, id string, opts shim.StartOpts) (_ shim.BootstrapParams, retErr error) {
+	var params shim.BootstrapParams
+	params.Version = 3
+	params.Protocol = "ttrpc"
+
+	cmd, err := newCommand(ctx, id, opts.Address, opts.TTRPCAddress, opts.Debug)
+	if err != nil {
+		return params, err
 	}
 	grouping := id
 	spec, err := readSpec()
 	if err != nil {
-		return "", err
+		return params, err
 	}
 	for _, group := range groupLabels {
 		if groupID, ok := spec.Annotations[group]; ok {
@@ -162,78 +285,120 @@ func (s *service) StartShim(ctx context.Context, id, containerdBinary, container
 			break
 		}
 	}
-	address, err := shim.SocketAddress(ctx, grouping)
-	if err != nil {
-		return "", err
-	}
-	socket, err := shim.NewSocket(address)
-	if err != nil {
-		if strings.Contains(err.Error(), "address already in use") {
-			if err := shim.WriteAddress("address", address); err != nil {
-				return "", err
-			}
-			return address, nil
-		}
-		return "", err
-	}
-	defer socket.Close()
-	f, err := socket.File()
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
 
-	cmd.ExtraFiles = append(cmd.ExtraFiles, f)
+	var sockets []*shimSocket
+	defer func() {
+		if retErr != nil {
+			for _, s := range sockets {
+				s.Close()
+			}
+		}
+	}()
+
+	s, err := newShimSocket(ctx, opts.Address, grouping, false)
+	if err != nil {
+		if errdefs.IsAlreadyExists(err) {
+			params.Address = s.addr
+			return params, nil
+		}
+		return params, err
+	}
+	sockets = append(sockets, s)
+	cmd.ExtraFiles = append(cmd.ExtraFiles, s.f)
+
+	if opts.Debug {
+		s, err = newShimSocket(ctx, opts.Address, grouping, true)
+		if err != nil {
+			return params, err
+		}
+		sockets = append(sockets, s)
+		cmd.ExtraFiles = append(cmd.ExtraFiles, s.f)
+	}
+
+	goruntime.LockOSThread()
+	if os.Getenv("SCHED_CORE") != "" {
+		if err := schedcore.Create(schedcore.ProcessGroup); err != nil {
+			return params, fmt.Errorf("enable sched core support: %w", err)
+		}
+	}
 
 	if err := cmd.Start(); err != nil {
-		return "", err
+		return params, err
 	}
+
+	goruntime.UnlockOSThread()
+
 	defer func() {
-		if err != nil {
+		if retErr != nil {
 			cmd.Process.Kill()
 		}
 	}()
 	// make sure to wait after start
 	go cmd.Wait()
-	if err := shim.WriteAddress("address", address); err != nil {
-		return "", err
+
+	if err := shim.AdjustOOMScore(cmd.Process.Pid); err != nil {
+		return params, fmt.Errorf("failed to adjust OOM score for shim: %w", err)
 	}
-	if err := shim.SetScore(cmd.Process.Pid); err != nil {
-		return "", errors.Wrap(err, "failed to set OOM Score on shim")
-	}
-	return address, nil
+
+	params.Address = sockets[0].addr
+	return params, nil
 }
 
-func (s *service) Cleanup(ctx context.Context) (*taskAPI.DeleteResponse, error) {
+func (m manager) Stop(ctx context.Context, id string) (shim.StopStatus, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
-		return nil, err
+		return shim.StopStatus{}, err
 	}
-	path := filepath.Join(filepath.Dir(cwd), s.id)
 
-	// TODO: Provide way to reach process
-	//ns, err := namespaces.NamespaceRequired(ctx)
-	//if err != nil {
-	//	return nil, err
-	//}
+	path := filepath.Join(filepath.Dir(cwd), id)
+	// ns, err := namespaces.NamespaceRequired(ctx)
+	// if err != nil {
+	// 	return shim.StopStatus{}, err
+	// }
+	// runtime, err := runc.ReadRuntime(path)
+	// if err != nil {
+	// 	return shim.StopStatus{}, err
+	// }
+	// opts, err := runc.ReadOptions(path)
+	// if err != nil {
+	// 	return shim.StopStatus{}, err
+	// }
+	// root := process.RuncRoot
+	// if opts != nil && opts.Root != "" {
+	// 	root = opts.Root
+	// }
 
-	//runtime, err := wasmtime.ReadRuntime(path)
-	//if err != nil {
-	//	return nil, err
-	//}
-	//r := proc.NewRunc(proc.RuncRoot, path, ns, runtime, "", false)
-	//if err := r.Delete(ctx, s.id, &runcC.DeleteOpts{
-	//	Force: true,
-	//}); err != nil {
-	//	logrus.WithError(err).Warn("failed to remove runc container")
-	//}
-	if err := mount.UnmountAll(filepath.Join(path, "rootfs"), 0); err != nil {
-		logrus.WithError(err).Warn("failed to cleanup rootfs mount")
+	// r := process.NewRunc(root, path, ns, runtime, false)
+	// if err := r.Delete(ctx, id, &runcC.DeleteOpts{
+	// 	Force: true,
+	// }); err != nil {
+	// 	log.G(ctx).WithError(err).Warn("failed to remove runc container")
+	// }
+	if err := mount.UnmountRecursive(filepath.Join(path, "rootfs"), 0); err != nil {
+		log.G(ctx).WithError(err).Warn("failed to cleanup rootfs mount")
 	}
-	return &taskAPI.DeleteResponse{
+	// pid, err := runcC.ReadPidFile(filepath.Join(path, process.InitPidFile))
+	// if err != nil {
+	// 	log.G(ctx).WithError(err).Warn("failed to read init pid file")
+	// }
+	return shim.StopStatus{
 		ExitedAt:   time.Now(),
-		ExitStatus: 128 + uint32(unix.SIGKILL),
+		ExitStatus: 128 + int(unix.SIGKILL),
+		//Pid:        pid,
 	}, nil
+}
+
+func (m manager) Info(ctx context.Context, optionsR io.Reader) (*apitypes.RuntimeInfo, error) {
+	info := &types.RuntimeInfo{
+		Name: m.name,
+	}
+	return info, nil
+}
+
+// RegisterTTRPC allows TTRPC services to be registered with the underlying server
+func (s *service) RegisterTTRPC(server *ttrpc.Server) error {
+	taskAPI.RegisterTTRPCTaskService(server, s)
+	return nil
 }
 
 // Create a new initial process and container with the underlying OCI runtime
@@ -282,7 +447,7 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.
 	p, err := container.Start(ctx, r)
 	if err != nil {
 		s.eventSendMu.Unlock()
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	//if err := s.ep.Add(container.ID, container.Cgroup()); err != nil {
 	//	logrus.WithError(err).Error("add cg to OOM monitor")
@@ -314,7 +479,7 @@ func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAP
 	}
 	p, err := container.Delete(ctx, r)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	// if we deleted our init task, close the platform and send the task delete event
 	if r.ExecID == "" {
@@ -330,12 +495,12 @@ func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAP
 			ContainerID: container.ID,
 			Pid:         uint32(p.Pid()),
 			ExitStatus:  uint32(p.ExitStatus()),
-			ExitedAt:    p.ExitedAt(),
+			ExitedAt:    protobuf.ToTimestamp(p.ExitedAt()),
 		})
 	}
 	return &taskAPI.DeleteResponse{
 		ExitStatus: uint32(p.ExitStatus()),
-		ExitedAt:   p.ExitedAt(),
+		ExitedAt:   protobuf.ToTimestamp(p.ExitedAt()),
 		Pid:        uint32(p.Pid()),
 	}, nil
 }
@@ -347,11 +512,11 @@ func (s *service) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (*pty
 		return nil, err
 	}
 	if container.ProcessExists(r.ExecID) {
-		return nil, errdefs.ToGRPCf(errdefs.ErrAlreadyExists, "id %s", r.ExecID)
+		return nil, errgrpc.ToGRPCf(errdefs.ErrAlreadyExists, "id %s", r.ExecID)
 	}
 	process, err := container.Exec(ctx, r)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	s.send(&eventstypes.TaskExecAdded{
@@ -368,7 +533,7 @@ func (s *service) ResizePty(ctx context.Context, r *taskAPI.ResizePtyRequest) (*
 		return nil, err
 	}
 	if err := container.ResizePty(ctx, r); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
 }
@@ -387,18 +552,18 @@ func (s *service) State(ctx context.Context, r *taskAPI.StateRequest) (*taskAPI.
 	if err != nil {
 		return nil, err
 	}
-	status := task.StatusUnknown
+	status := task.Status_UNKNOWN
 	switch st {
 	case "created":
-		status = task.StatusCreated
+		status = task.Status_CREATED
 	case "running":
-		status = task.StatusRunning
+		status = task.Status_RUNNING
 	case "stopped":
-		status = task.StatusStopped
+		status = task.Status_STOPPED
 	case "paused":
-		status = task.StatusPaused
+		status = task.Status_PAUSED
 	case "pausing":
-		status = task.StatusPausing
+		status = task.Status_PAUSING
 	}
 	sio := p.Stdio()
 	return &taskAPI.StateResponse{
@@ -411,7 +576,7 @@ func (s *service) State(ctx context.Context, r *taskAPI.StateRequest) (*taskAPI.
 		Stderr:     sio.Stderr,
 		Terminal:   sio.Terminal,
 		ExitStatus: uint32(p.ExitStatus()),
-		ExitedAt:   p.ExitedAt(),
+		ExitedAt:   protobuf.ToTimestamp(p.ExitedAt()),
 	}, nil
 }
 
@@ -422,7 +587,7 @@ func (s *service) Pause(ctx context.Context, r *taskAPI.PauseRequest) (*ptypes.E
 		return nil, err
 	}
 	if err := container.Pause(ctx); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	s.send(&eventstypes.TaskPaused{
 		ContainerID: container.ID,
@@ -437,7 +602,7 @@ func (s *service) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (*ptypes
 		return nil, err
 	}
 	if err := container.Resume(ctx); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	s.send(&eventstypes.TaskResumed{
 		ContainerID: container.ID,
@@ -452,7 +617,7 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (*ptypes.Emp
 		return nil, err
 	}
 	if err := container.Kill(ctx, r); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
 }
@@ -463,9 +628,9 @@ func (s *service) Pids(ctx context.Context, r *taskAPI.PidsRequest) (*taskAPI.Pi
 	if err != nil {
 		return nil, err
 	}
-	pids, err := s.getContainerPids(ctx, r.ID)
+	pids, err := s.getContainerPids(ctx, container)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	var processes []*task.ProcessInfo
 	for _, pid := range pids {
@@ -477,9 +642,9 @@ func (s *service) Pids(ctx context.Context, r *taskAPI.PidsRequest) (*taskAPI.Pi
 				d := &options.ProcessDetails{
 					ExecID: p.ID(),
 				}
-				a, err := typeurl.MarshalAny(d)
+				a, err := typeurl.MarshalAnyToProto(d)
 				if err != nil {
-					return nil, errors.Wrapf(err, "failed to marshal process %d info", pid)
+					return nil, fmt.Errorf("failed to marshal process %d info: %w", pid, err)
 				}
 				pInfo.Info = a
 				break
@@ -511,7 +676,7 @@ func (s *service) Checkpoint(ctx context.Context, r *taskAPI.CheckpointTaskReque
 		return nil, err
 	}
 	if err := container.Checkpoint(ctx, r); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
 }
@@ -523,7 +688,7 @@ func (s *service) Update(ctx context.Context, r *taskAPI.UpdateTaskRequest) (*pt
 		return nil, err
 	}
 	if err := container.Update(ctx, r); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	return empty, nil
 }
@@ -536,13 +701,13 @@ func (s *service) Wait(ctx context.Context, r *taskAPI.WaitRequest) (*taskAPI.Wa
 	}
 	p, err := container.Process(r.ExecID)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	p.Wait()
 
 	return &taskAPI.WaitResponse{
 		ExitStatus: uint32(p.ExitStatus()),
-		ExitedAt:   p.ExitedAt(),
+		ExitedAt:   protobuf.ToTimestamp(p.ExitedAt()),
 	}, nil
 }
 
@@ -565,7 +730,7 @@ func (s *service) Shutdown(ctx context.Context, r *taskAPI.ShutdownRequest) (*pt
 		s.mu.Unlock()
 		return empty, nil
 	}
-	s.cancel()
+	s.shutdown.Shutdown()
 	close(s.events)
 	return empty, nil
 }
@@ -577,9 +742,9 @@ func (s *service) Stats(ctx context.Context, r *taskAPI.StatsRequest) (*taskAPI.
 	}
 	cg := container.Cgroup()
 	if cg == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "cgroup does not exist")
+		return nil, errgrpc.ToGRPCf(errdefs.ErrNotFound, "cgroup does not exist")
 	}
-	stats, err := cg.Stat(cgroups.IgnoreNotExist)
+	stats, err := cg.Stat(cgroup1.IgnoreNotExist)
 	if err != nil {
 		return nil, err
 	}
@@ -588,7 +753,7 @@ func (s *service) Stats(ctx context.Context, r *taskAPI.StatsRequest) (*taskAPI.
 		return nil, err
 	}
 	return &taskAPI.StatsResponse{
-		Stats: data,
+		Stats: typeurl.MarshalProto(data),
 	}, nil
 }
 
@@ -637,7 +802,7 @@ func (s *service) checkProcesses(e wasmtime.Exit) {
 						ID:          p.ID(),
 						Pid:         uint32(e.Pid),
 						ExitStatus:  uint32(e.Status),
-						ExitedAt:    p.ExitedAt(),
+						ExitedAt:    protobuf.ToTimestamp(p.ExitedAt()),
 					})
 					return
 				}
@@ -666,7 +831,7 @@ func shouldKillAllOnExit(bundlePath string) (bool, error) {
 	return true, nil
 }
 
-func (s *service) getContainerPids(ctx context.Context, id string) ([]uint32, error) {
+func (s *service) getContainerPids(ctx context.Context, container *wasmtime.Container) ([]uint32, error) {
 	// TODO: Return type capable of getting pids
 	return []uint32{}, nil
 	//container, err := s.getContainer(id)
@@ -675,7 +840,7 @@ func (s *service) getContainerPids(ctx context.Context, id string) ([]uint32, er
 	//}
 	//p, err := container.Process("")
 	//if err != nil {
-	//	return nil, errdefs.ToGRPC(err)
+	//	return nil, errgrpc.ToGRPC(err)
 	//}
 	//ps, err := p.(*proc.Init).Runtime().Ps(ctx, id)
 	//if err != nil {
@@ -707,7 +872,7 @@ func (s *service) getContainer(id string) (*wasmtime.Container, error) {
 	container := s.containers[id]
 	s.mu.Unlock()
 	if container == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "container not created")
+		return nil, errgrpc.ToGRPCf(errdefs.ErrNotFound, "container not created")
 	}
 	return container, nil
 }

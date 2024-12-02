@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 /*
@@ -20,7 +21,7 @@ package wasmtime
 
 import (
 	"github.com/containerd/containerd/api/events"
-	"github.com/containerd/containerd/runtime"
+	"github.com/containerd/containerd/v2/core/runtime"
 	"github.com/sirupsen/logrus"
 )
 
