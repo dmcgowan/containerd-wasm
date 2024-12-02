@@ -124,7 +124,7 @@ func NewContainer(ctx context.Context, platform stdio.Platform, r *taskAPI.Creat
 	} else {
 		return nil, errors.Wrapf(errdefs.ErrInvalidArgument, "no root provided")
 	}
-	rootRemap = fmt.Sprintf("/:%s", rootfs)
+	rootRemap = fmt.Sprintf("%s::/", rootfs) // --dir <HOST_DIR[::GUEST_DIR]> (wasmtime v27)
 	if len(spec.Process.Args) > 0 {
 		// TODO: bound this
 		spec.Process.Args[0] = filepath.Join(rootfs, spec.Process.Args[0])
@@ -472,7 +472,7 @@ func (p *Process) Resize(ws console.WinSize) error {
 func (p *Process) Start(context.Context) (err error) {
 	var args []string
 	for _, rm := range p.remaps {
-		args = append(args, "--mapdir="+rm)
+		args = append(args, "--dir="+rm)
 	}
 	for _, env := range p.env {
 		args = append(args, "--env="+env)
