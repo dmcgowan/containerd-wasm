@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,6 +37,7 @@ import (
 	"github.com/containerd/console"
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v3"
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/stdio"
 	"github.com/containerd/errdefs"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -469,7 +471,7 @@ func (p *Process) Resize(ws console.WinSize) error {
 	return nil
 }
 
-func (p *Process) Start(context.Context) (err error) {
+func (p *Process) Start(ctx context.Context) (err error) {
 	var args []string
 	for _, rm := range p.remaps {
 		args = append(args, "--dir="+rm)
@@ -497,32 +499,96 @@ func (p *Process) Start(context.Context) (err error) {
 		closers = append(closers, stdin)
 	}
 
-	if p.stdio.Stdout != "" {
-		stdout, err := os.OpenFile(p.stdio.Stdout, os.O_WRONLY, 0)
-		if err != nil {
-			return errors.Wrapf(err, "unable to open stdout: %s", p.stdio.Stdout)
-		}
-		defer func() {
-			if err != nil {
-				stdout.Close()
-			}
-		}()
-		cmd.Stdout = stdout
-		closers = append(closers, stdout)
+	u, err := url.Parse(p.stdio.Stdout)
+	if err != nil {
+		return fmt.Errorf("unable to parse stdout uri: %w", err)
 	}
-
-	if p.stdio.Stderr != "" {
-		stderr, err := os.OpenFile(p.stdio.Stderr, os.O_WRONLY, 0)
-		if err != nil {
-			return errors.Wrapf(err, "unable to open stderr: %s", p.stdio.Stderr)
-		}
-		defer func() {
+	if u.Scheme == "" {
+		u.Scheme = "fifo"
+	}
+	switch u.Scheme {
+	case "fifo":
+		if p.stdio.Stdout != "" {
+			ou, err := url.Parse(p.stdio.Stdout)
 			if err != nil {
-				stderr.Close()
+				return fmt.Errorf("fifo: unable to parse stdout uri: %w", err)
 			}
-		}()
-		cmd.Stderr = stderr
-		closers = append(closers, stderr)
+			stdout, err := os.OpenFile(ou.Path, os.O_WRONLY, 0)
+			if err != nil {
+				return errors.Wrapf(err, "unable to open stdout: %s", p.stdio.Stdout)
+			}
+			defer func() {
+				if err != nil {
+					stdout.Close()
+				}
+			}()
+			cmd.Stdout = stdout
+			closers = append(closers, stdout)
+		}
+
+		if p.stdio.Stderr != "" {
+			eu, err := url.Parse(p.stdio.Stderr)
+			if err != nil {
+				return fmt.Errorf("fifo: unable to parse stderr uri: %w", err)
+			}
+			stderr, err := os.OpenFile(eu.Path, os.O_WRONLY, 0)
+			if err != nil {
+				return errors.Wrapf(err, "unable to open stderr: %s", p.stdio.Stderr)
+			}
+			defer func() {
+				if err != nil {
+					stderr.Close()
+				}
+			}()
+			cmd.Stderr = stderr
+			closers = append(closers, stderr)
+		}
+	case "binary":
+		// bianary scheme is implemented based on https://github.com/containerd/containerd/blob/v2.0.0/cmd/containerd-shim-runc-v2/process/io.go#L247
+		ns, err := namespaces.NamespaceRequired(ctx)
+		if err != nil {
+			return err
+		}
+
+		out, err := newPipe()
+		if err != nil {
+			return fmt.Errorf("failed to create stdout pipes: %w", err)
+		}
+		cmd.Stdout = out.w
+		closers = append(closers, out)
+
+		serr, err := newPipe()
+		if err != nil {
+			return fmt.Errorf("failed to create stderr pipes: %w", err)
+		}
+		cmd.Stderr = serr.w
+		closers = append(closers, serr)
+
+		r, w, err := os.Pipe()
+		if err != nil {
+			return err
+		}
+		closers = append(closers, r, w)
+
+		cmd := NewBinaryCmd(u, p.id, ns)
+		cmd.ExtraFiles = append(cmd.ExtraFiles, out.r, serr.r, w)
+		// don't need to register this with the reaper or wait when
+		// running inside a shim
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("failed to start binary process: %w", err)
+		}
+		closers = append(closers, &closerFunc{f: cmd.Process.Kill})
+
+		// close our side of the pipe after start
+		if err := w.Close(); err != nil {
+			return fmt.Errorf("failed to close write pipe after start: %w", err)
+		}
+
+		// wait for the logging binary to be ready
+		b := make([]byte, 1)
+		if _, err := r.Read(b); err != nil && err != io.EOF {
+			return fmt.Errorf("failed to read from logging binary: %w", err)
+		}
 	}
 
 	p.mu.Lock()
@@ -585,4 +651,73 @@ func (p *Process) SetExited(status int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.exitStatus = status
+}
+
+func newPipe() (*pipe, error) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	return &pipe{
+		r: r,
+		w: w,
+	}, nil
+}
+
+type pipe struct {
+	r *os.File
+	w *os.File
+}
+
+func (p *pipe) Close() error {
+	var result []error
+
+	if err := p.w.Close(); err != nil {
+		result = append(result, fmt.Errorf("pipe: failed to close write pipe: %w", err))
+	}
+
+	if err := p.r.Close(); err != nil {
+		result = append(result, fmt.Errorf("pipe: failed to close read pipe: %w", err))
+	}
+
+	if len(result) > 0 {
+		retErr := fmt.Errorf("error during closing pipe")
+		for _, e := range result {
+			retErr = fmt.Errorf("%w, %w", retErr, e)
+		}
+		return retErr
+	}
+
+	return nil
+}
+
+type closerFunc struct {
+	f func() error
+}
+
+func (c *closerFunc) Close() error {
+	return c.f()
+}
+
+// NewBinaryCmd returns a Cmd to be used to start a logging binary.
+// The Cmd is generated from the provided uri, and the container ID and
+// namespace are appended to the Cmd environment.
+// ported from https://github.com/containerd/containerd/blob/v2.0.0/cmd/containerd-shim-runc-v2/process/io_util.go#L28
+func NewBinaryCmd(binaryURI *url.URL, id, ns string) *exec.Cmd {
+	var args []string
+	for k, vs := range binaryURI.Query() {
+		args = append(args, k)
+		if len(vs) > 0 {
+			args = append(args, vs[0])
+		}
+	}
+
+	cmd := exec.Command(binaryURI.Path, args...)
+
+	cmd.Env = append(cmd.Env,
+		"CONTAINER_ID="+id,
+		"CONTAINER_NAMESPACE="+ns,
+	)
+
+	return cmd
 }
